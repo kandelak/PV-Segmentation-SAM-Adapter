@@ -8,112 +8,123 @@ from tqdm import tqdm
 
 import datasets
 import models
-import utils
-
+import writer  
 from torchvision import transforms
 from mmcv.runner import load_checkpoint
+import metric
+from PIL import Image
+import matplotlib.pyplot as plt
+from datasets.resample_transform import Resampler
 
+class Test:
+    
+        def __init__(self, model, test_loader, trained_on_dataset, save_path, original_image_dataset, trained_on_factor, tested_on_factor):
+            self.model = model
+            self.test_loader = test_loader
+            self.save_path = save_path
+            self.trained_on_dataset = trained_on_dataset
+            self.original_image_dataset = original_image_dataset
+            self.trained_on_factor = trained_on_factor
+            self.tested_on_factor = tested_on_factor
+            self.metrics = metric.Metrics(['JaccardIndex', 'DiceCoefficient', 'Precision', 'Recall', 'Accuracy', 'F1Score', 'AUCROC'], device=model.device)
+            self.writer = writer.Writer(os.path.join(self.save_path, 'test'))
+    
+        def start(self):
+    
+            self.model.eval()
+    
+            pbar = tqdm(total=len(self.test_loader), leave=False, desc='test')
+   
+            for i, batch in enumerate(self.test_loader):
+                for k, v in batch.items():
+                    batch[k] = v.to(self.model.device)
+    
+            
+                inp = batch['inp']
+                gt = batch['gt']
+                gt = (gt>0)
+    
+                pred = torch.sigmoid(self.model.infer(inp))
+                
+                self.metrics.reset_current()
+                self.metrics.update(pred, gt)
+                values = self.metrics.compute()
 
-def batched_predict(model, inp, coord, bsize):
-    with torch.no_grad():
-        model.gen_feat(inp)
-        n = coord.shape[1]
-        ql = 0
-        preds = []
-        while ql < n:
-            qr = min(ql + bsize, n)
-            pred = model.query_rgb(coord[:, ql: qr, :])
-            preds.append(pred)
-            ql = qr
-        pred = torch.cat(preds, dim=1)
-    return pred, preds
+                self.writer.write_metrics_and_means(values, i)
+                self.writer.write_pr_curve(pred,gt, i)
+                self.writer.write_gt_vs_pred_figure(pred, gt, i, "Gt vs Pred")
+            
+                original_image  = self.original_image_dataset[i]["inp"]
+                original_image = self.original_image_dataset.inverse_transform(original_image)
 
+                tested_on_image = self.original_image_dataset.inverse_transform(inp)
 
-def tensor2PIL(tensor):
-    toPIL = transforms.ToPILImage()
-    return toPIL(tensor)
+                trained_on_image = self.trained_on_dataset[i]["inp"]
+                trained_on_image = self.trained_on_dataset.inverse_transform(trained_on_image)
 
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def eval_psnr(loader, model, data_norm=None, eval_type=None, eval_bsize=None,
-              verbose=False):
-    model.eval()
-    if data_norm is None:
-        data_norm = {
-            'inp': {'sub': [0], 'div': [1]},
-            'gt': {'sub': [0], 'div': [1]}
-        }
-
-    if eval_type == 'f1':
-        metric_fn = utils.calc_f1
-        metric1, metric2, metric3, metric4 = 'f1', 'auc', 'none', 'none'
-    elif eval_type == 'fmeasure':
-        metric_fn = utils.calc_fmeasure
-        metric1, metric2, metric3, metric4 = 'f_mea', 'mae', 'none', 'none'
-    elif eval_type == 'ber':
-        metric_fn = utils.calc_ber
-        metric1, metric2, metric3, metric4 = 'shadow', 'non_shadow', 'ber', 'none'
-    elif eval_type == 'cod':
-        metric_fn = utils.calc_cod
-        metric1, metric2, metric3, metric4 = 'sm', 'em', 'wfm', 'mae'
-
-    val_metric1 = utils.Averager()
-    val_metric2 = utils.Averager()
-    val_metric3 = utils.Averager()
-    val_metric4 = utils.Averager()
-
-    pbar = tqdm(loader, leave=False, desc='val')
-
-    for batch in pbar:
-        for k, v in batch.items():
-            batch[k] = v.cuda()
-
-        inp = batch['inp']
-
-        pred = torch.sigmoid(model.infer(inp))
-
-        result1, result2, result3, result4 = metric_fn(pred, batch['gt'])
-        val_metric1.add(result1.item(), inp.shape[0])
-        val_metric2.add(result2.item(), inp.shape[0])
-        val_metric3.add(result3.item(), inp.shape[0])
-        val_metric4.add(result4.item(), inp.shape[0])
-
-        if verbose:
-            pbar.set_description('val {} {:.4f}'.format(metric1, val_metric1.item()))
-            pbar.set_description('val {} {:.4f}'.format(metric2, val_metric2.item()))
-            pbar.set_description('val {} {:.4f}'.format(metric3, val_metric3.item()))
-            pbar.set_description('val {} {:.4f}'.format(metric4, val_metric4.item()))
-
-    return val_metric1.item(), val_metric2.item(), val_metric3.item(), val_metric4.item()
-
+                self.writer.write_trained_on_vs_tested_on_vs_original(trained_on_image, tested_on_image, original_image, self.trained_on_factor, self.tested_on_factor, i, "Trained on vs Tested on vs Original")
+                self.writer.write_overlay_confusion_matrix_figure(tested_on_image, pred, gt, values, i, "Overlay Confusion Matrix")
+                
+                if pbar is not None:
+                    pbar.update(1)
+    
+            if pbar is not None:
+                pbar.close()
 
 if __name__ == '__main__':
+  
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config')
-    parser.add_argument('--model')
+    parser.add_argument('--config', default='configs/sam-vit-b.yaml')
+    parser.add_argument('--model', help="Path to the trained model checkpoint")
     parser.add_argument('--prompt', default='none')
+    parser.add_argument('--dataset', default='val_dataset')
     args = parser.parse_args()
 
+
+
+    save_path = None
     with open(args.config, 'r') as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
-    spec = config['test_dataset']
-    dataset = datasets.make(spec['dataset'])
-    dataset = datasets.make(spec['wrapper'], args={'dataset': dataset})
-    loader = DataLoader(dataset, batch_size=spec['batch_size'],
-                        num_workers=8)
+        save_path = config['write_dir']
+        os.makedirs(save_path, exist_ok=True)
+        # Save config
+        with open(os.path.join(save_path, 'config.yaml'), 'w') as f:
+            yaml.dump(config, f)
+    
+    
+    
+    os.makedirs(save_path, exist_ok=True)
 
-    model = models.make(config['model']).cuda()
-    sam_checkpoint = torch.load(args.model, map_location='cuda:0')
+    dataset_to_use = args.dataset
+
+    # Create Testing Dataset and its loader
+    spec = config[dataset_to_use]
+    testing_dataset = datasets.make(spec['dataset'])
+    testing_dataset = datasets.make(spec['wrapper'], args={'dataset': testing_dataset})
+    loader = DataLoader(testing_dataset, batch_size=spec['batch_size'],
+                        num_workers=0)
+    
+    model = models.make(config['model'])
+    device = model.device
+    model = model.to(device)
+
+    sam_checkpoint = torch.load(args.model, map_location=device)
     model.load_state_dict(sam_checkpoint, strict=True)
     
-    metric1, metric2, metric3, metric4 = eval_psnr(loader, model,
-                                                   data_norm=config.get('data_norm'),
-                                                   eval_type=config.get('eval_type'),
-                                                   eval_bsize=config.get('eval_bsize'),
-                                                   verbose=True)
-    print('metric1: {:.4f}'.format(metric1))
-    print('metric2: {:.4f}'.format(metric2))
-    print('metric3: {:.4f}'.format(metric3))
-    print('metric4: {:.4f}'.format(metric4))
+    # Create Training Dataset
+    trained_on_factor = config["train_dataset"]["wrapper"]["args"]["resampling_factor"]
+    config[dataset_to_use]["wrapper"]["args"]["resampling_factor"] = trained_on_factor
+    trained_on_dataset = datasets.make(spec['dataset'])
+    trained_on_dataset = datasets.make(spec['wrapper'], args={'dataset': trained_on_dataset})
+
+
+
+    # Load original image dataset (without any resampling)
+    spec = config[dataset_to_use]
+    config[dataset_to_use]["wrapper"]["args"]["resampling_factor"] = 1
+    original_image_dataset = datasets.make(spec['dataset'])
+    original_image_dataset = datasets.make(spec['wrapper'], args={'dataset': original_image_dataset})
+
+    test = Test(model, loader, trained_on_dataset, save_path,  original_image_dataset, trained_on_factor, trained_on_factor)
+    test.start()
+
